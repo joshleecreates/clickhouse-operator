@@ -23,6 +23,7 @@ import (
 	log "github.com/altinity/clickhouse-operator/pkg/announcer"
 	"github.com/altinity/clickhouse-operator/pkg/chop"
 	chopinformers "github.com/altinity/clickhouse-operator/pkg/client/informers/externalversions"
+	"github.com/altinity/clickhouse-operator/pkg/controller"
 	"github.com/altinity/clickhouse-operator/pkg/controller/chi"
 )
 
@@ -84,6 +85,12 @@ func initClickHouse(ctx context.Context) {
 		kubeInformerFactory,
 	)
 
+	// Register callback for configuration changes to reconcile all CHIs
+	chop.Get().ConfigManager.RegisterConfigChangeCallback(func() {
+		log.V(1).F().Info("Configuration changed, triggering reconciliation for all CHIs")
+		reconcileAllCHIsOnConfigChange()
+	})
+
 	// Start Informers
 	kubeInformerFactory.Start(ctx.Done())
 	chopInformerFactory.Start(ctx.Done())
@@ -97,4 +104,92 @@ func runClickHouse(ctx context.Context) {
 	// Start main CHI controller
 	log.V(1).F().Info("Starting CHI controller")
 	chiController.Run(ctx)
+}
+
+// reconcileAllCHIsOnConfigChange triggers reconciliation for all ClickHouseInstallations
+// in watched namespaces when configuration changes occur
+func reconcileAllCHIsOnConfigChange() {
+	log.V(1).F().Info("Starting reconciliation of all CHIs due to configuration change")
+
+	// Get the ConfigManager instance
+	configManager := chop.Get().ConfigManager
+	if configManager == nil {
+		log.V(1).F().Error("ConfigManager is nil, cannot reconcile CHIs")
+		return
+	}
+
+	// Get the chopClient from ConfigManager
+	chopClient := configManager.ChopClient()
+	if chopClient == nil {
+		log.V(1).F().Error("chopClient is nil, cannot reconcile CHIs")
+		return
+	}
+
+	// Get watched namespaces from configuration
+	config := configManager.Config()
+	if config == nil {
+		log.V(1).F().Error("Config is nil, cannot determine watched namespaces")
+		return
+	}
+
+	watchedNamespaces := config.Watch.Namespaces
+
+	// If no specific namespaces are configured, we need to handle the "watch all namespaces" case
+	if len(watchedNamespaces) == 0 {
+		log.V(1).F().Info("No specific namespaces configured, will attempt to reconcile CHIs in operator namespace")
+		// Default to operator's own namespace if available
+		if operatorNamespace, ok := configManager.GetRuntimeParam("OPERATOR_POD_NAMESPACE"); ok && operatorNamespace != "" {
+			watchedNamespaces = []string{operatorNamespace}
+		} else {
+			log.V(1).F().Warning("Cannot determine operator namespace, skipping CHI reconciliation")
+			return
+		}
+	}
+
+	log.V(1).F().Info("Reconciling CHIs in %d watched namespaces: %v", len(watchedNamespaces), watchedNamespaces)
+
+	// Process each watched namespace
+	for _, namespace := range watchedNamespaces {
+		if namespace == "" {
+			continue
+		}
+
+		log.V(1).F().Info("Processing namespace: %s", namespace)
+
+		// List all ClickHouseInstallations in this namespace
+		chiList, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).List(context.TODO(), controller.NewListOptions())
+		if err != nil {
+			log.V(1).F().Error("Failed to list ClickHouseInstallations in namespace %s: %v", namespace, err)
+			continue
+		}
+
+		log.V(1).F().Info("Found %d ClickHouseInstallations in namespace %s", len(chiList.Items), namespace)
+
+		// Process each CHI in the namespace
+		for i := range chiList.Items {
+			chi := &chiList.Items[i]
+			originalChi := chi.DeepCopy()
+
+			if chi.Annotations == nil {
+				chi.Annotations = make(map[string]string)
+			}
+
+			// Add unique annotation to trigger reconciliation
+			reconcileAnnotation := "internal.altinity.com/reconcile-on-config-change"
+			chi.Annotations[reconcileAnnotation] = time.Now().Format(time.RFC3339Nano)
+
+			log.V(1).F().Info("Updating CHI %s/%s to trigger reconciliation", namespace, chi.Name)
+
+			// Update the CHI in the Kubernetes API
+			_, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).Update(context.TODO(), chi, controller.NewUpdateOptions())
+			if err != nil {
+				log.V(1).F().Error("Failed to update CHI %s/%s: %v", namespace, chi.Name, err)
+			} else {
+				log.V(1).F().Info("Successfully triggered reconciliation for CHI %s/%s", namespace, chi.Name)
+			}
+			chi.Annotations = originalChi.Annotations // Restore original annotations to undo changes in the informer cache
+		}
+	}
+
+	log.V(1).F().Info("Completed reconciliation trigger for all CHIs")
 }
