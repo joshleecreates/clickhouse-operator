@@ -88,7 +88,7 @@ func initClickHouse(ctx context.Context) {
 	// Register callback for configuration changes to reconcile all CHIs
 	chop.Get().ConfigManager.RegisterConfigChangeCallback(func() {
 		log.V(1).F().Info("Configuration changed, triggering reconciliation for all CHIs")
-		reconcileAllCHIsOnConfigChange()
+		reconcileAllCHIsOnConfigChange(ctx)
 	})
 
 	// Start Informers
@@ -108,9 +108,7 @@ func runClickHouse(ctx context.Context) {
 
 // reconcileAllCHIsOnConfigChange triggers reconciliation for all ClickHouseInstallations
 // in watched namespaces when configuration changes occur
-func reconcileAllCHIsOnConfigChange() {
-	log.V(1).F().Info("Starting reconciliation of all CHIs due to configuration change")
-
+func reconcileAllCHIsOnConfigChange(ctx context.Context) {
 	// Get the ConfigManager instance
 	configManager := chop.Get().ConfigManager
 	if configManager == nil {
@@ -136,7 +134,6 @@ func reconcileAllCHIsOnConfigChange() {
 
 	// If no specific namespaces are configured, we need to handle the "watch all namespaces" case
 	if len(watchedNamespaces) == 0 {
-		log.V(1).F().Info("No specific namespaces configured, will attempt to reconcile CHIs in operator namespace")
 		// Default to operator's own namespace if available
 		if operatorNamespace, ok := configManager.GetRuntimeParam("OPERATOR_POD_NAMESPACE"); ok && operatorNamespace != "" {
 			watchedNamespaces = []string{operatorNamespace}
@@ -146,48 +143,50 @@ func reconcileAllCHIsOnConfigChange() {
 		}
 	}
 
-	log.V(1).F().Info("Reconciling CHIs in %d watched namespaces: %v", len(watchedNamespaces), watchedNamespaces)
-
 	// Process each watched namespace
 	for _, namespace := range watchedNamespaces {
 		if namespace == "" {
 			continue
 		}
 
-		log.V(1).F().Info("Processing namespace: %s", namespace)
-
 		// List all ClickHouseInstallations in this namespace
-		chiList, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).List(context.TODO(), controller.NewListOptions())
+		chiList, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).List(ctx, controller.NewListOptions())
 		if err != nil {
 			log.V(1).F().Error("Failed to list ClickHouseInstallations in namespace %s: %v", namespace, err)
 			continue
 		}
 
-		log.V(1).F().Info("Found %d ClickHouseInstallations in namespace %s", len(chiList.Items), namespace)
-
 		// Process each CHI in the namespace
 		for i := range chiList.Items {
-			chi := &chiList.Items[i]
-			originalChi := chi.DeepCopy()
+			oldChi := &chiList.Items[i]
+			newChi := oldChi.DeepCopy()
 
-			if chi.Annotations == nil {
-				chi.Annotations = make(map[string]string)
+			// Current DeepCopy does not include the Reconcile settings, so we need to set them explicitly
+			for k := range newChi.Spec.Configuration.Clusters {
+				newChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsMaxConcurrencyPercent = oldChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsMaxConcurrencyPercent
+
+				newChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsThreadsNumber = oldChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsThreadsNumber
+
+				if newChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsThreadsNumber == 0 {
+					newChi.Spec.Configuration.Clusters[k].Reconcile.Runtime.ReconcileShardsThreadsNumber = 1
+				}
+			}
+
+			if newChi.Annotations == nil {
+				newChi.Annotations = make(map[string]string)
 			}
 
 			// Add unique annotation to trigger reconciliation
 			reconcileAnnotation := "internal.altinity.com/reconcile-on-config-change"
-			chi.Annotations[reconcileAnnotation] = time.Now().Format(time.RFC3339Nano)
+			newChi.Annotations[reconcileAnnotation] = time.Now().Format(time.RFC3339Nano)
 
-			log.V(1).F().Info("Updating CHI %s/%s to trigger reconciliation", namespace, chi.Name)
+			newChi.SetGeneration(newChi.GetGeneration() + 1)
 
 			// Update the CHI in the Kubernetes API
-			_, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).Update(context.TODO(), chi, controller.NewUpdateOptions())
+			_, err := chopClient.ClickhouseV1().ClickHouseInstallations(namespace).Update(ctx, newChi, controller.NewUpdateOptions())
 			if err != nil {
-				log.V(1).F().Error("Failed to update CHI %s/%s: %v", namespace, chi.Name, err)
-			} else {
-				log.V(1).F().Info("Successfully triggered reconciliation for CHI %s/%s", namespace, chi.Name)
+				log.V(1).F().Error("Failed to update CHI %s/%s: %v", namespace, newChi.Name, err)
 			}
-			chi.Annotations = originalChi.Annotations // Restore original annotations to undo changes in the informer cache
 		}
 	}
 
